@@ -1,0 +1,6 @@
+# requirements for the script
+requests
+beautifulsoup4
+yfinance
+pandas
+tqdm
