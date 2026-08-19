@@ -27,34 +27,69 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-ISIN_LIST_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+import re
+import os
 
+ISIN_LIST_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+RESULTS_DIR = "results"
 
 def get_tw_stock_list() -> List[Tuple[str, str]]:
-    """從台灣 ISIN 頁面抓取上市/上櫃證券與代碼。
-    回傳 list of (code, name)，code 為純數字字串（如 '2330'）。
-    """
-    resp = requests.get(ISIN_LIST_URL, timeout=20)
-    resp.encoding = 'big5'
+    \"\"\"更健壯的從台灣 ISIN 頁面抓取上市/上櫃代碼與名稱。
+    回傳 list of (code, name)，code 為純數字字串（例如 '2330'）。
+    同時會把原始 HTML 存到 results/isin_page.html 以便除錯。
+    \"\"\"
+    try:
+        resp = requests.get(ISIN_LIST_URL, timeout=20)
+    except Exception as e:
+        raise RuntimeError(f\"無法連到 ISIN 網頁: {e}\")
     if resp.status_code != 200:
-        raise RuntimeError(f"無法抓取 ISIN 列表, status={resp.status_code}")
+        raise RuntimeError(f\"無法抓取 ISIN 列表, status={resp.status_code}\")
+    # 若網站宣告的 encoding 不對，使用 apparent_encoding 作為備援
+    if not resp.encoding or resp.encoding.lower() in ('iso-8859-1', 'latin-1'):
+        resp.encoding = resp.apparent_encoding or 'big5'
+    # 最終以 big5/utf-8 互換嘗試也可以
+    html = resp.text
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    table = soup.find("table")
-    if not table:
-        raise RuntimeError("找不到 ISIN 列表的 table")
+    # 儲存原始 HTML 以便後續檢查
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    try:
+        with open(os.path.join(RESULTS_DIR, "isin_page.html"), "w", encoding="utf-8") as fh:
+            fh.write(html)
+    except Exception:
+        # 忽略寫檔錯誤，但仍繼續解析
+        pass
 
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
     stocks = []
-    for row in table.find_all("tr"):
-        cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-        if len(cols) >= 2:
-            # 欄位範例: '2330' 'TSMC' ... 早期可能包含說明欄，取前兩欄
-            code = cols[0]
-            name = cols[1]
-            # 代碼通常是 4 位數或 3-4 位數字; 過濾掉不符合的列
-            if code.isdigit():
-                stocks.append((code, name))
-    # 去重與排序
+
+    # 先嘗試由 table 找出代碼/名稱
+    for table in tables:
+        for row in table.find_all("tr"):
+            cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if len(cols) >= 2:
+                code = cols[0].strip().strip(\"'\\u200b\\u00a0\")
+                name = cols[1].strip()
+                # 寬鬆驗證：3 或 4 位數字 (有些公司代碼可能是 3 位或 4 位)
+                if re.match(r'^\\d{3,4}$', code):
+                    stocks.append((code, name))
+
+    # 若 table 解析不到，再用 regex 備援抓取頁面內的 3-4 位數字序列
+    if not stocks:
+        codes = sorted(set(re.findall(r'\\b(\\d{3,4})\\b', html)))
+        for code in codes:
+            # 嘗試在鄰近文字抓公司名稱（簡單 approach）
+            name = ""
+            # 找到 code 在 html 出現的位置，取後面一小段當作名稱候選
+            m = re.search(r'(' + re.escape(code) + r')[^<\\n\\r]{0,80}', html)
+            if m:
+                snippet = m.group(0)
+                # 從 snippet 去掉數字本身，取剩下文字當 name candidate
+                cand = re.sub(re.escape(code), '', snippet).strip(' -:：,，\\t\\n\\r')
+                name = re.sub(r'\\s+', ' ', cand).strip()
+            stocks.append((code, name))
+
+    # 去重並保持順序
     seen = set()
     out = []
     for code, name in stocks:
@@ -62,7 +97,6 @@ def get_tw_stock_list() -> List[Tuple[str, str]]:
             seen.add(code)
             out.append((code, name))
     return out
-
 
 def pct_change_for_ticker(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> Tuple[str, float, int]:
     """回傳 (ticker, pct_change, valid_days)
