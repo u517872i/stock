@@ -29,25 +29,29 @@ from tqdm import tqdm
 
 import re
 import os
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Tuple
 
 ISIN_LIST_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
 RESULTS_DIR = "results"
 
 def get_tw_stock_list() -> List[Tuple[str, str]]:
-    \"\"\"更健壯的從台灣 ISIN 頁面抓取上市/上櫃代碼與名稱。
+    """更健壯的從台灣 ISIN 頁面抓取上市/上櫃代碼與名稱。
     回傳 list of (code, name)，code 為純數字字串（例如 '2330'）。
     同時會把原始 HTML 存到 results/isin_page.html 以便除錯。
-    \"\"\"
+    """
     try:
         resp = requests.get(ISIN_LIST_URL, timeout=20)
     except Exception as e:
-        raise RuntimeError(f\"無法連到 ISIN 網頁: {e}\")
+        raise RuntimeError(f"無法連到 ISIN 網頁: {e}")
     if resp.status_code != 200:
-        raise RuntimeError(f\"無法抓取 ISIN 列表, status={resp.status_code}\")
+        raise RuntimeError(f"無法抓取 ISIN 列表, status={resp.status_code}")
+
     # 若網站宣告的 encoding 不對，使用 apparent_encoding 作為備援
-    if not resp.encoding or resp.encoding.lower() in ('iso-8859-1', 'latin-1'):
-        resp.encoding = resp.apparent_encoding or 'big5'
-    # 最終以 big5/utf-8 互換嘗試也可以
+    if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
+        resp.encoding = resp.apparent_encoding or "big5"
+
     html = resp.text
 
     # 儲存原始 HTML 以便後續檢查
@@ -56,7 +60,6 @@ def get_tw_stock_list() -> List[Tuple[str, str]]:
         with open(os.path.join(RESULTS_DIR, "isin_page.html"), "w", encoding="utf-8") as fh:
             fh.write(html)
     except Exception:
-        # 忽略寫檔錯誤，但仍繼續解析
         pass
 
     soup = BeautifulSoup(html, "html.parser")
@@ -68,25 +71,22 @@ def get_tw_stock_list() -> List[Tuple[str, str]]:
         for row in table.find_all("tr"):
             cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
             if len(cols) >= 2:
-                code = cols[0].strip().strip(\"'\\u200b\\u00a0\")
+                code = cols[0].strip().strip("\u200b\u00a0'\"")
                 name = cols[1].strip()
-                # 寬鬆驗證：3 或 4 位數字 (有些公司代碼可能是 3 位或 4 位)
-                if re.match(r'^\\d{3,4}$', code):
+                # 寬鬆驗證：3 或 4 位數字
+                if re.match(r'^\d{3,4}$', code):
                     stocks.append((code, name))
 
     # 若 table 解析不到，再用 regex 備援抓取頁面內的 3-4 位數字序列
     if not stocks:
-        codes = sorted(set(re.findall(r'\\b(\\d{3,4})\\b', html)))
+        codes = sorted(set(re.findall(r'\b(\d{3,4})\b', html)))
         for code in codes:
-            # 嘗試在鄰近文字抓公司名稱（簡單 approach）
             name = ""
-            # 找到 code 在 html 出現的位置，取後面一小段當作名稱候選
-            m = re.search(r'(' + re.escape(code) + r')[^<\\n\\r]{0,80}', html)
+            m = re.search(r'(' + re.escape(code) + r')[^<\n\r]{0,80}', html)
             if m:
                 snippet = m.group(0)
-                # 從 snippet 去掉數字本身，取剩下文字當 name candidate
-                cand = re.sub(re.escape(code), '', snippet).strip(' -:：,，\\t\\n\\r')
-                name = re.sub(r'\\s+', ' ', cand).strip()
+                cand = re.sub(re.escape(code), '', snippet).strip(' -:：,，\t\n\r')
+                name = re.sub(r'\s+', ' ', cand).strip()
             stocks.append((code, name))
 
     # 去重並保持順序
