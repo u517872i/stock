@@ -27,76 +27,127 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-import re
+import time
+import csv
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Tuple
 
 ISIN_LIST_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
 RESULTS_DIR = "results"
+CACHED_TICKERS_PATH = "data/tickers_cached.csv"  # 若抓不到網頁，可放這個檔當回退
+
+def _read_cached_tickers(path: str) -> List[Tuple[str, str]]:
+    out = []
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, newline='', encoding='utf-8') as fh:
+            reader = csv.reader(fh)
+            for row in reader:
+                if not row:
+                    continue
+                # 支援有 header 或沒有 header 的檔案 (code,name)
+                code = str(row[0]).strip()
+                name = row[1].strip() if len(row) > 1 else ""
+                if re.match(r'^\d{3,4}$', code):
+                    out.append((code, name))
+    except Exception:
+        return []
+    return out
 
 def get_tw_stock_list() -> List[Tuple[str, str]]:
-    """更健壯的從台灣 ISIN 頁面抓取上市/上櫃代碼與名稱。
-    回傳 list of (code, name)，code 為純數字字串（例如 '2330'）。
-    同時會把原始 HTML 存到 results/isin_page.html 以便除錯。
+    """從 ISIN 抓代碼，包含重試與回退快取檔案的機制。
+    回傳 list of (code, name)。若抓取失敗，會嘗試載入 data/tickers_cached.csv。
     """
-    try:
-        resp = requests.get(ISIN_LIST_URL, timeout=20)
-    except Exception as e:
-        raise RuntimeError(f"無法連到 ISIN 網頁: {e}")
-    if resp.status_code != 200:
-        raise RuntimeError(f"無法抓取 ISIN 列表, status={resp.status_code}")
-
-    # 若網站宣告的 encoding 不對，使用 apparent_encoding 作為備援
-    if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
-        resp.encoding = resp.apparent_encoding or "big5"
-
-    html = resp.text
-
-    # 儲存原始 HTML 以便後續檢查
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    try:
-        with open(os.path.join(RESULTS_DIR, "isin_page.html"), "w", encoding="utf-8") as fh:
-            fh.write(html)
-    except Exception:
-        pass
 
-    soup = BeautifulSoup(html, "html.parser")
-    tables = soup.find_all("table")
-    stocks = []
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; find_top_gainers/1.0; +https://github.com/)",
+        "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7"
+    })
 
-    # 先嘗試由 table 找出代碼/名稱
-    for table in tables:
-        for row in table.find_all("tr"):
-            cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cols) >= 2:
-                code = cols[0].strip().strip("\u200b\u00a0'\"")
-                name = cols[1].strip()
-                # 寬鬆驗證：3 或 4 位數字
-                if re.match(r'^\d{3,4}$', code):
+    max_attempts = 5
+    timeout = 60  # 增加 timeout（秒）
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.get(ISIN_LIST_URL, timeout=timeout)
+            # 儲存原始 HTML 以便檢查
+            try:
+                html_path = os.path.join(RESULTS_DIR, "isin_page.html")
+                with open(html_path, "w", encoding="utf-8") as fh:
+                    fh.write(resp.text)
+            except Exception:
+                pass
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"ISIN 回傳 status={resp.status_code}")
+
+            # 編碼處理
+            if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
+                resp.encoding = resp.apparent_encoding or "big5"
+            html = resp.text
+
+            soup = BeautifulSoup(html, "html.parser")
+            tables = soup.find_all("table")
+            stocks = []
+
+            # 優先由 table 解析
+            for table in tables:
+                for row in table.find_all("tr"):
+                    cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+                    if len(cols) >= 2:
+                        code = cols[0].strip().strip("\u200b\u00a0'\"")
+                        name = cols[1].strip()
+                        if re.match(r'^\d{3,4}$', code):
+                            stocks.append((code, name))
+
+            # 若 table 解析不到，再用 regex 備援抓取頁面內的 3-4 位數字序列
+            if not stocks:
+                codes = sorted(set(re.findall(r'\b(\d{3,4})\b', html)))
+                for code in codes:
+                    name = ""
+                    m = re.search(r'(' + re.escape(code) + r')[^<\n\r]{0,80}', html)
+                    if m:
+                        snippet = m.group(0)
+                        cand = re.sub(re.escape(code), '', snippet).strip(' -:：,，\t\n\r')
+                        name = re.sub(r'\s+', ' ', cand).strip()
                     stocks.append((code, name))
 
-    # 若 table 解析不到，再用 regex 備援抓取頁面內的 3-4 位數字序列
-    if not stocks:
-        codes = sorted(set(re.findall(r'\b(\d{3,4})\b', html)))
-        for code in codes:
-            name = ""
-            m = re.search(r'(' + re.escape(code) + r')[^<\n\r]{0,80}', html)
-            if m:
-                snippet = m.group(0)
-                cand = re.sub(re.escape(code), '', snippet).strip(' -:：,，\t\n\r')
-                name = re.sub(r'\s+', ' ', cand).strip()
-            stocks.append((code, name))
+            # 去重並保持順序
+            seen = set()
+            out = []
+            for code, name in stocks:
+                if code not in seen:
+                    seen.add(code)
+                    out.append((code, name))
 
-    # 去重並保持順序
-    seen = set()
-    out = []
-    for code, name in stocks:
-        if code not in seen:
-            seen.add(code)
-            out.append((code, name))
-    return out
+            if out:
+                return out
+            else:
+                # 若沒有結果當作錯誤，進入重試流程
+                raise RuntimeError("解析到的股票列表為空 (no table / js-rendered?)")
+
+        except Exception as e:
+            # 若最後一次嘗試仍失敗，跳出做回退
+            if attempt == max_attempts:
+                break
+            sleep_sec = min(60, 2 ** attempt)
+            time.sleep(sleep_sec)
+
+    # 回退：嘗試讀 data/tickers_cached.csv
+    cached = _read_cached_tickers(CACHED_TICKERS_PATH)
+    if cached:
+        return cached
+
+    # 最後回報錯誤，並提醒檢查 results/isin_page.html
+    raise RuntimeError(
+        "無法在 ISIN 網頁取得股票代碼，且找不到回退快取檔案 "
+        f"({CACHED_TICKERS_PATH}). 請檢查 results/isin_page.html 或提供 data/tickers_cached.csv (code,name)."
+    )
 
 def pct_change_for_ticker(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> Tuple[str, float, int]:
     """回傳 (ticker, pct_change, valid_days)
