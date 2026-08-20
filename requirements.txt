@@ -4,3 +4,5 @@ beautifulsoup4
 yfinance
 pandas
 tqdm
+lxml
+html5lib
