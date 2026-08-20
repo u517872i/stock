@@ -1,8 +1,8 @@
 name: Run find_top_gainers
 
 on:
-  # push:
-  #   branches: [ main ]
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       start:
@@ -21,28 +21,49 @@ on:
         description: 'Limit tickers (0=all)'
         required: false
         default: '0'
-      max-workers:
-        description: 'Max workers for parallel fetch'
+      batch-size:
+        description: 'Batch size for yf.download'
         required: false
-        default: '10'
+        default: '100'
+      tickers-file:
+        description: 'Optional CSV of tickers (code,name) in repo'
+        required: false
+        default: ''
+      force-refresh:
+        description: 'Force refresh ISIN cache (true/false)'
+        required: false
+        default: 'false'
+      resume:
+        description: 'Resume from partial results if present (true/false)'
+        required: false
+        default: 'false'
+      max-retries:
+        description: 'max retries for batch download'
+        required: false
+        default: '3'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python (with pip cache)
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # ensure required parsers for pandas.read_html + other libs
           pip install -r requirements.txt
+          pip install lxml html5lib || true
 
       - name: Run find_top_gainers
         env:
@@ -50,12 +71,30 @@ jobs:
           END: ${{ github.event.inputs.end || '2026-08-14' }}
           TOP: ${{ github.event.inputs.top || '50' }}
           LIMIT: ${{ github.event.inputs.limit || '0' }}
-          MAX_WORKERS: ${{ github.event.inputs['max-workers'] || '10' }}
+          BATCH_SIZE: ${{ github.event.inputs['batch-size'] || '100' }}
+          TICKERS_FILE: ${{ github.event.inputs['tickers-file'] || '' }}
+          FORCE_REFRESH: ${{ github.event.inputs['force-refresh'] || 'false' }}
+          RESUME: ${{ github.event.inputs['resume'] || 'false' }}
+          MAX_RETRIES: ${{ github.event.inputs['max-retries'] || '3' }}
         run: |
           mkdir -p results
           echo "Run at: $(date -u)" > results/run_info.txt
-          echo "start=${START}, end=${END}, top=${TOP}, limit=${LIMIT}, max_workers=${MAX_WORKERS}" >> results/run_info.txt
-          python3 scripts/find_top_gainers.py --start "${START}" --end "${END}" --top "${TOP}" --limit "${LIMIT}" --max-workers "${MAX_WORKERS}" 2>&1 | tee results/output.txt
+          echo "start=${START}, end=${END}, top=${TOP}, limit=${LIMIT}, batch_size=${BATCH_SIZE}, tickers_file=${TICKERS_FILE}, force_refresh=${FORCE_REFRESH}, resume=${RESUME}, max_retries=${MAX_RETRIES}" >> results/run_info.txt
+
+          ARGS="--start \"${START}\" --end \"${END}\" --top \"${TOP}\" --limit \"${LIMIT}\" --batch-size \"${BATCH_SIZE}\" --max-retries \"${MAX_RETRIES}\""
+          if [ -n "${TICKERS_FILE}" ] && [ "${TICKERS_FILE}" != "''" ]; then
+            ARGS="${ARGS} --tickers-file \"${TICKERS_FILE}\""
+          fi
+          if [ "${FORCE_REFRESH}" = "true" ]; then
+            ARGS="${ARGS} --force-refresh"
+          fi
+          if [ "${RESUME}" = "true" ]; then
+            ARGS="${ARGS} --resume"
+          fi
+
+          # run the script and tee logs into results/output.txt
+          # note: use eval to expand quoted ARGS
+          eval python3 scripts/find_top_gainers.py ${ARGS} 2>&1 | tee results/output.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
