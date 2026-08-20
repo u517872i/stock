@@ -31,6 +31,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 from tqdm import tqdm
+from io import StringIO
+from bs4 import BeautifulSoup
 
 # Constants
 ISIN_BASE = "https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
@@ -76,22 +78,54 @@ def _fetch_isin_html(mode: int, session: requests.Session, timeout: int = 30) ->
     return html
 
 
+
 def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
-    # pandas.read_html requires lxml or html5lib; returns list of tables
-    # try to find the table that contains '有價證券' or '有價證券別' column
+    """
+    更健壯的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
+    """
+    # 1) safe pd.read_html via StringIO (解掉 FutureWarning)
     try:
-        tables = pd.read_html(html, encoding="utf-8", flavor="lxml")
+        tables = pd.read_html(StringIO(html), encoding="utf-8", flavor="lxml")
     except Exception:
-        # fallback: try html5lib
-        tables = pd.read_html(html, encoding="utf-8", flavor="html5lib")
-    if not tables:
+        try:
+            tables = pd.read_html(StringIO(html), encoding="utf-8", flavor="html5lib")
+        except Exception:
+            tables = []
+
+    if tables:
+        # 優先找包含關鍵欄位的 table
+        for t in tables:
+            cols = [str(c) for c in t.columns]
+            if any("有價" in c or "證券" in c or "代號" in c or "名稱" in c for c in cols):
+                return t
+        # fallback: 回傳第一個表格
+        return tables[0]
+
+    # 2) fallback: 用 BeautifulSoup 手動解析第一個 <table>
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
         return pd.DataFrame()
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        if any("有價" in c or "證券" in c for c in cols):
-            return t
-    # fallback to first table
-    return tables[0]
+
+    rows = []
+    for tr in table.find_all("tr"):
+        cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        rows.append(cols)
+
+    if not rows:
+        return pd.DataFrame()
+
+    # pad rows to same length
+    maxc = max(len(r) for r in rows)
+    rows_padded = [r + [""] * (maxc - len(r)) for r in rows]
+    df = pd.DataFrame(rows_padded)
+
+    # 如果第一列看起來像 header（含中文欄名），把它當 header
+    first_row = " ".join(map(str, df.iloc[0].tolist()))
+    if any(k in first_row for k in ["有價", "證券", "代號", "名稱"]):
+        df.columns = df.iloc[0].tolist()
+        df = df.iloc[1:].reset_index(drop=True)
+    return df
 
 
 def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
