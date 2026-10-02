@@ -339,6 +339,9 @@ def process_batches(tickers: List[str], start: str, end: str, args):
             else:
                 df_rows.to_csv(PARTIAL_CSV, index=False, header=True, encoding="utf-8-sig")
             all_rows.extend(df_rows.to_dict("records"))
+            if i == 0:
+                print("[FAIL-FAST] 第一個 batch 就沒有有效資料，停止執行。")
+                return None
             continue
 
         rows = []
@@ -381,6 +384,15 @@ def process_batches(tickers: List[str], start: str, end: str, args):
                     rows.append({"ticker": t, "pct": pct, "n_days": nd})
                     if not pd.isna(pct):
                         valid_data_found = True
+
+        batch_valid_count = sum(1 for row in rows if not pd.isna(row.get("pct")))
+        if batch_valid_count == 0 and i == 0:
+            print("[FAIL-FAST] 第一個 batch 就沒有任何有效資料，停止執行。")
+            print("可能原因：")
+            print("  1. 日期區間沒有交易資料")
+            print("  2. ticker 格式錯誤")
+            print("  3. yfinance 回傳為空")
+            return None
 
         df_rows = pd.DataFrame(rows)
         if os.path.exists(PARTIAL_CSV):
