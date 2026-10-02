@@ -317,7 +317,11 @@ def process_batches(tickers: List[str], start: str, end: str, args):
 
     total = len(tickers)
     n_batches = math.ceil(total / args.batch_size) if total else 0
+    print(f"準備處理 {total} 檔股票，分成 {n_batches} 個 batch")
+    
     all_rows = []
+    valid_data_found = False
+    
     for i in tqdm(range(n_batches), desc="batches"):
         start_idx = i * args.batch_size
         batch_codes = tickers[start_idx: start_idx + args.batch_size]
@@ -326,7 +330,8 @@ def process_batches(tickers: List[str], start: str, end: str, args):
         batch_tickers = [f"{c}.TW" for c in batch_codes]
         try:
             df = download_batch_with_retry(batch_tickers, start, end, max_retries=args.max_retries, backoff=2)
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] batch {i} 下載失敗: {e}")
             rows = [{"ticker": t, "pct": float("nan"), "n_days": 0} for t in batch_tickers]
             df_rows = pd.DataFrame(rows)
             if os.path.exists(PARTIAL_CSV):
@@ -338,6 +343,7 @@ def process_batches(tickers: List[str], start: str, end: str, args):
 
         rows = []
         if df is None or df.empty:
+            print(f"[WARN] batch {i}: yfinance 回傳空資料")
             for t in batch_tickers:
                 rows.append({"ticker": t, "pct": float("nan"), "n_days": 0})
         else:
@@ -360,6 +366,8 @@ def process_batches(tickers: List[str], start: str, end: str, args):
                         s = pd.Series(dtype=float)
                     pct, nd = compute_pct_from_series(s)
                     rows.append({"ticker": t, "pct": pct, "n_days": nd})
+                    if not pd.isna(pct):
+                        valid_data_found = True
             else:
                 if "Adj Close" in df.columns:
                     s = df["Adj Close"].dropna()
@@ -371,6 +379,8 @@ def process_batches(tickers: List[str], start: str, end: str, args):
                 for t in batch_tickers:
                     pct, nd = compute_pct_from_series(s)
                     rows.append({"ticker": t, "pct": pct, "n_days": nd})
+                    if not pd.isna(pct):
+                        valid_data_found = True
 
         df_rows = pd.DataFrame(rows)
         if os.path.exists(PARTIAL_CSV):
@@ -380,6 +390,11 @@ def process_batches(tickers: List[str], start: str, end: str, args):
         all_rows.extend(df_rows.to_dict("records"))
         time.sleep(0.2)
 
+    # FAIL-FAST: 沒有任何有效資料就直接停止
+    if not valid_data_found:
+        print("[FAIL-FAST] 沒有取得任何有效價格資料，停止處理。")
+        return None
+
     if os.path.exists(PARTIAL_CSV):
         final_df = pd.read_csv(PARTIAL_CSV, dtype={"ticker": str})
     else:
@@ -388,7 +403,7 @@ def process_batches(tickers: List[str], start: str, end: str, args):
         final_df["ticker"] = final_df["ticker"].astype(str)
     final_df = final_df.dropna(subset=["pct"])
     if final_df.empty:
-        print("找不到任何有效資料。")
+        print("[FAIL-FAST] 過濾後沒有有效資料，停止處理。")
         return None
     final_df = final_df.sort_values("pct", ascending=False).reset_index(drop=True)
     try:
@@ -418,6 +433,7 @@ def main(argv=None):
         print("日期格式錯誤，請使用 YYYY-MM-DD")
         return
 
+    # FAIL-FAST: 沒有股票清單就直接退出
     stocks = []
     if args.tickers_file:
         stocks = read_tickers_from_csv(args.tickers_file, limit=args.limit)
@@ -430,7 +446,11 @@ def main(argv=None):
         stocks = load_tickers(args)
 
     if not stocks:
-        print("沒有可用的股票清單，終止。請提供 --tickers-file 或確認網頁能連線/快取。")
+        print("[FAIL-FAST] 股票清單為空，停止執行。")
+        print("可能原因：")
+        print("  1. 證交所網頁無法連線或格式已變更")
+        print("  2. 快取檔案損毀，請用 --force-refresh 重新抓取")
+        print("  3. 可手動提供 --tickers-file CSV 檔案")
         return
 
     if args.limit and args.limit > 0:
@@ -440,7 +460,10 @@ def main(argv=None):
     print(f"開始計算 {len(codes)} 檔股票的漲幅，期間 {args.start} ~ {args.end}，batch_size={args.batch_size}")
 
     final_df = process_batches(codes, args.start, args.end, args)
-    if final_df is None:
+    
+    # FAIL-FAST: 沒有有效結果就直接退出
+    if final_df is None or final_df.empty:
+        print("[FAIL-FAST] 沒有有效的漲幅資料，停止執行。")
         return
 
     try:
