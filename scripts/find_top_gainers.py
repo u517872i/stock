@@ -191,7 +191,7 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
         except Exception as e:
             print(f"[DEBUG] 市場別過濾失敗: {e}，不做額外過濾")
 
-    print(f"[DEBUG] 開始從 {namecol} 欄位提取���碼...")
+    print(f"[DEBUG] 開始從 {namecol} 欄位提取代碼...")
     for v in df[namecol].astype(str).fillna(""):
         m = re.match(r"^\s*(\d{3,4})\s*(.+?)\s*$", v)
         if m:
@@ -287,20 +287,110 @@ def load_tickers(args) -> List[Tuple[str, str]]:
     return stocks
 
 
-def download_batch_with_retry(tickers: List[str], start: str, end: str, max_retries: int = 3, backoff: int = 2):
-    attempt = 0
+def _valid_ticker_variants(ticker: str) -> List[str]:
+    t = str(ticker).strip()
+    base = t.replace(".TW", "")
+    return [f"{base}.TW", base]
+
+
+def _extract_price_series_from_df(df: pd.DataFrame, ticker: str) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    # MultiIndex columns: 可能為 (Ticker, 'Adj Close')
+    if isinstance(df.columns, pd.MultiIndex):
+        target = None
+        if "Adj Close" in df.columns.get_level_values(1):
+            target = "Adj Close"
+        elif "Close" in df.columns.get_level_values(1):
+            target = "Close"
+        else:
+            return pd.Series(dtype=float)
+
+        if ticker in df.columns.get_level_values(0):
+            try:
+                s = df[target][ticker].dropna()
+                return s
+            except Exception:
+                pass
+
+        # If the symbol is not keyed under ticker due to formatting, try search by suffix match.
+        for col in df.columns:
+            if isinstance(col, tuple) and len(col) >= 2 and str(col[0]).replace(".TW", "") == str(ticker).replace(".TW", ""):
+                try:
+                    return df[col[1]][col[0]].dropna()
+                except Exception:
+                    return pd.Series(dtype=float)
+        return pd.Series(dtype=float)
+
+    # regular columns
+    if "Adj Close" in df.columns:
+        return df["Adj Close"].dropna()
+    if "Close" in df.columns:
+        return df["Close"].dropna()
+    numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if numeric:
+        return df[numeric[-1]].dropna()
+    return pd.Series(dtype=float)
+
+
+def download_single_ticker(ticker: str, start: str, end: str):
     end_exclusive = pd.to_datetime(end) + pd.Timedelta(days=1)
-    while attempt <= max_retries:
+    for variant in _valid_ticker_variants(ticker):
         try:
-            df = yf.download(tickers=tickers, start=start, end=end_exclusive.strftime("%Y-%m-%d"),
-                             progress=False, auto_adjust=False, threads=False)
-            return df
-        except Exception:
-            attempt += 1
-            if attempt > max_retries:
-                raise
-            sleep = backoff ** attempt
-            time.sleep(min(sleep, 60))
+            df = yf.download(
+                tickers=[variant],
+                start=start,
+                end=end_exclusive.strftime("%Y-%m-%d"),
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            print(f"[DEBUG] ticker {variant} failed: {e}")
+    return pd.DataFrame()
+
+
+def download_batch_with_retry(tickers: List[str], start: str, end: str, max_retries: int = 3, backoff: int = 2):
+    """First try batch download. If any ticker is invalid, fall back to individual downloads for the batch."""
+    end_exclusive = pd.to_datetime(end) + pd.Timedelta(days=1)
+    for attempt in range(max_retries + 1):
+        try:
+            df = yf.download(
+                tickers=tickers,
+                start=start,
+                end=end_exclusive.strftime("%Y-%m-%d"),
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            print(f"[WARN] batch download failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+            if attempt < max_retries:
+                time.sleep(min((backoff ** (attempt + 1)), 60))
+                continue
+            break
+
+    print(f"[DEBUG] 批次下載失敗，改為逐檔下載 batch 大小={len(tickers)}")
+    batch_rows = []
+    for ticker in tickers:
+        try:
+            single_df = download_single_ticker(ticker, start, end)
+            if single_df is None or single_df.empty:
+                batch_rows.append({"ticker": ticker, "pct": float("nan"), "n_days": 0})
+                continue
+            s = _extract_price_series_from_df(single_df, ticker)
+            pct, nd = compute_pct_from_series(s)
+            batch_rows.append({"ticker": ticker, "pct": pct, "n_days": nd})
+        except Exception as e:
+            print(f"[WARN] individual download failed for {ticker}: {e}")
+            batch_rows.append({"ticker": ticker, "pct": float("nan"), "n_days": 0})
+
+    return pd.DataFrame(batch_rows)
 
 
 def compute_pct_from_series(s: pd.Series) -> Tuple[float, int]:
@@ -359,7 +449,11 @@ def process_batches(tickers: List[str], start: str, end: str, args):
             for t in batch_tickers:
                 rows.append({"ticker": t, "pct": float("nan"), "n_days": 0})
         else:
-            if isinstance(df.columns, pd.MultiIndex):
+            # This branch now handles both regular batch fetch and the individual-fallback DataFrame.
+            # For fallback, df is already a per-ticker dataframe with 'ticker' and 'pct' columns.
+            if {"ticker", "pct"}.issubset(df.columns):
+                rows = df.to_dict("records")
+            elif isinstance(df.columns, pd.MultiIndex):
                 top_level = df.columns.levels[0]
                 value_col = None
                 if "Adj Close" in top_level:
@@ -409,7 +503,7 @@ def process_batches(tickers: List[str], start: str, end: str, args):
         else:
             df_rows.to_csv(PARTIAL_CSV, index=False, header=True, encoding="utf-8-sig")
         all_rows.extend(df_rows.to_dict("records"))
-        time.sleep(0.2)
+        time.sleep(0.5)
 
     # FAIL-FAST: 沒有任何有效資料就直接停止
     if not valid_data_found:
