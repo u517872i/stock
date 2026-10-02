@@ -84,6 +84,7 @@ def _fetch_isin_html(mode: int, session: requests.Session, timeout: int = 30) ->
 def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     """
     更健壯的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
+    若表格欄位變成 0,1,2...，則將第一列視為 header 並重新解析。
     """
     print("[DEBUG] 開始解析 HTML 表格...")
     try:
@@ -102,6 +103,17 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
         for i, t in enumerate(tables):
             cols = [str(c) for c in t.columns]
             print(f"[DEBUG] 表格 {i}: 列數={len(t)}, 欄位={cols[:5]}")
+            # handle new format where first row is header but read_html treats it as numeric columns
+            if cols and all(re.fullmatch(r"\d+", str(c)) for c in cols[:min(5, len(cols))]):
+                print(f"[DEBUG] 檢測到數字欄位名稱，將第一列視為 header")
+                # preserve original row layout by using first row as column names and dropping it
+                if not t.empty:
+                    t = t.copy()
+                    t.columns = [str(x).strip() for x in t.iloc[0].tolist()]
+                    t = t.iloc[1:].reset_index(drop=True)
+                    print(f"[DEBUG] 修正後欄位={t.columns.tolist()[:10]}")
+                    if any("有價" in str(c) or "證券" in str(c) or "代號" in str(c) or "名稱" in str(c) for c in t.columns):
+                        return t
             if any("有價" in c or "證券" in c or "代號" in c or "名稱" in c for c in cols):
                 print(f"[DEBUG] 找到符合的表格 (index={i})")
                 return t
