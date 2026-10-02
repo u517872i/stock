@@ -83,7 +83,7 @@ def _fetch_isin_html(mode: int, session: requests.Session, timeout: int = 30) ->
 
 def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     """
-    更健壯的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
+    更健壖的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
     若表格欄位變成 0,1,2...，則將第一列視為 header 並重新解析。
     """
     print("[DEBUG] 開始解析 HTML 表格...")
@@ -103,10 +103,8 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
         for i, t in enumerate(tables):
             cols = [str(c) for c in t.columns]
             print(f"[DEBUG] 表格 {i}: 列數={len(t)}, 欄位={cols[:5]}")
-            # handle new format where first row is header but read_html treats it as numeric columns
             if cols and all(re.fullmatch(r"\d+", str(c)) for c in cols[:min(5, len(cols))]):
                 print(f"[DEBUG] 檢測到數字欄位名稱，將第一列視為 header")
-                # preserve original row layout by using first row as column names and dropping it
                 if not t.empty:
                     t = t.copy()
                     t.columns = [str(x).strip() for x in t.iloc[0].tolist()]
@@ -151,19 +149,20 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
 def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
     print(f"[DEBUG] _extract_code_name 開始，df.shape={df.shape}")
     print(f"[DEBUG] 欄位: {df.columns.tolist()}")
-    
+
     col_candidates = df.columns.tolist()
-    sec_type_col = None
+    market_col = None
     namecol = None
+
     for c in col_candidates:
         s = str(c)
-        if "有價" in s and "證券" in s:
-            sec_type_col = c
-            print(f"[DEBUG] 找到 sec_type_col: {c}")
+        if "市場別" in s or "市場" in s:
+            market_col = c
+            print(f"[DEBUG] 找到 market_col: {c}")
         if "代號" in s and "名稱" in s:
             namecol = c
             print(f"[DEBUG] 找到 namecol: {c}")
-    
+
     if namecol is None:
         print("[DEBUG] namecol 未找到，嘗試按欄位內容搜尋...")
         for c in col_candidates:
@@ -181,20 +180,18 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
         print("[DEBUG] 仍未找到 namecol，回傳空列表")
         return out
 
-    if sec_type_col is not None:
+    # Use the actual market column to filter stock rows.
+    # The '有價證券代號及名稱' column is the listing field itself, not the type field.
+    if market_col is not None:
         try:
-            df = df[df[sec_type_col].astype(str).str.contains("股票", na=False)]
-            print(f"[DEBUG] 過濾後 df.shape={df.shape}")
+            market_values = df[market_col].astype(str)
+            keep_mask = market_values.str.contains(r"上市|上櫃|興櫃|股票", regex=True, na=False)
+            df = df[keep_mask]
+            print(f"[DEBUG] 市場別過濾後 df.shape={df.shape}")
         except Exception as e:
-            print(f"[DEBUG] str.contains 失敗: {e}，改用手動迴圈")
-            filtered = []
-            for idx, value in df[sec_type_col].items():
-                if "股票" in str(value):
-                    filtered.append(idx)
-            df = df.loc[filtered]
-            print(f"[DEBUG] 手動過濾後 df.shape={df.shape}")
+            print(f"[DEBUG] 市場別過濾失敗: {e}，不做額外過濾")
 
-    print(f"[DEBUG] 開始從 {namecol} 欄位提取代碼...")
+    print(f"[DEBUG] 開始從 {namecol} 欄位提取���碼...")
     for v in df[namecol].astype(str).fillna(""):
         m = re.match(r"^\s*(\d{3,4})\s*(.+?)\s*$", v)
         if m:
@@ -330,10 +327,10 @@ def process_batches(tickers: List[str], start: str, end: str, args):
     total = len(tickers)
     n_batches = math.ceil(total / args.batch_size) if total else 0
     print(f"準備處理 {total} 檔股票，分成 {n_batches} 個 batch")
-    
+
     all_rows = []
     valid_data_found = False
-    
+
     for i in tqdm(range(n_batches), desc="batches"):
         start_idx = i * args.batch_size
         batch_codes = tickers[start_idx: start_idx + args.batch_size]
@@ -457,7 +454,6 @@ def main(argv=None):
         print("日期格式錯誤，請使用 YYYY-MM-DD")
         return
 
-    # FAIL-FAST: 沒有股票清單就直接退出
     stocks = []
     if args.tickers_file:
         stocks = read_tickers_from_csv(args.tickers_file, limit=args.limit)
@@ -484,8 +480,7 @@ def main(argv=None):
     print(f"開始計算 {len(codes)} 檔股票的漲幅，期間 {args.start} ~ {args.end}，batch_size={args.batch_size}")
 
     final_df = process_batches(codes, args.start, args.end, args)
-    
-    # FAIL-FAST: 沒有有效結果就直接退出
+
     if final_df is None or final_df.empty:
         print("[FAIL-FAST] 沒有有效的漲幅資料，停止執行。")
         return
