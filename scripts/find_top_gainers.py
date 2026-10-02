@@ -64,15 +64,18 @@ def read_tickers_from_csv(path: str, limit: int = 0) -> List[Tuple[str, str]]:
 
 def _fetch_isin_html(mode: int, session: requests.Session, timeout: int = 30) -> str:
     url = ISIN_BASE.format(mode=mode)
+    print(f"[DEBUG] 正在抓取 {url}")
     resp = session.get(url, timeout=timeout)
     # encoding fallback
     if not resp.encoding or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
         resp.encoding = resp.apparent_encoding or "big5"
     html = resp.text
+    print(f"[DEBUG] 收到 HTML，長度 {len(html)} bytes")
     os.makedirs(RESULTS_DIR, exist_ok=True)
     try:
         with open(os.path.join(RESULTS_DIR, f"isin_mode{mode}.html"), "w", encoding="utf-8") as fh:
             fh.write(html)
+        print(f"[DEBUG] HTML 已保存到 isin_mode{mode}.html")
     except Exception:
         pass
     return html
@@ -82,24 +85,34 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     """
     更健壯的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
     """
+    print("[DEBUG] 開始解析 HTML 表格...")
     try:
         tables = pd.read_html(StringIO(html), encoding="utf-8", flavor="lxml")
-    except Exception:
+        print(f"[DEBUG] pd.read_html (lxml) 成功，找到 {len(tables)} 個表格")
+    except Exception as e:
+        print(f"[DEBUG] pd.read_html (lxml) 失敗: {e}")
         try:
             tables = pd.read_html(StringIO(html), encoding="utf-8", flavor="html5lib")
-        except Exception:
+            print(f"[DEBUG] pd.read_html (html5lib) 成功，找到 {len(tables)} 個表格")
+        except Exception as e2:
+            print(f"[DEBUG] pd.read_html (html5lib) 也失敗: {e2}")
             tables = []
 
     if tables:
-        for t in tables:
+        for i, t in enumerate(tables):
             cols = [str(c) for c in t.columns]
+            print(f"[DEBUG] 表格 {i}: 列數={len(t)}, 欄位={cols[:5]}")
             if any("有價" in c or "證券" in c or "代號" in c or "名稱" in c for c in cols):
+                print(f"[DEBUG] 找到符合的表格 (index={i})")
                 return t
+        print(f"[DEBUG] 沒有找到含有關鍵欄位的表格，回傳第一個表格")
         return tables[0]
 
+    print("[DEBUG] pd.read_html 無法解析，改用 BeautifulSoup...")
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
+        print("[DEBUG] BeautifulSoup 也找不到 table")
         return pd.DataFrame()
 
     rows = []
@@ -107,6 +120,7 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
         cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
         rows.append(cols)
 
+    print(f"[DEBUG] BeautifulSoup 解析到 {len(rows)} 列")
     if not rows:
         return pd.DataFrame()
 
@@ -118,10 +132,14 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     if any(k in first_row for k in ["有價", "證券", "代號", "名稱"]):
         df.columns = df.iloc[0].tolist()
         df = df.iloc[1:].reset_index(drop=True)
+    print(f"[DEBUG] BeautifulSoup 生成 DataFrame: {df.shape}")
     return df
 
 
 def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
+    print(f"[DEBUG] _extract_code_name 開始，df.shape={df.shape}")
+    print(f"[DEBUG] 欄位: {df.columns.tolist()}")
+    
     col_candidates = df.columns.tolist()
     sec_type_col = None
     namecol = None
@@ -129,32 +147,42 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
         s = str(c)
         if "有價" in s and "證券" in s:
             sec_type_col = c
+            print(f"[DEBUG] 找到 sec_type_col: {c}")
         if "代號" in s and "名稱" in s:
             namecol = c
+            print(f"[DEBUG] 找到 namecol: {c}")
+    
     if namecol is None:
+        print("[DEBUG] namecol 未找到，嘗試按欄位內容搜尋...")
         for c in col_candidates:
             try:
                 sample = str(df[c].dropna().iloc[0])
+                if re.search(r"\d{3,4}", sample):
+                    namecol = c
+                    print(f"[DEBUG] 通過內容偵測找到 namecol: {c} (sample={sample})")
+                    break
             except Exception:
                 continue
-            if re.search(r"\d{3,4}", sample):
-                namecol = c
-                break
 
     out: List[Tuple[str, str]] = []
     if namecol is None:
+        print("[DEBUG] 仍未找到 namecol，回傳空列表")
         return out
 
     if sec_type_col is not None:
         try:
             df = df[df[sec_type_col].astype(str).str.contains("股票", na=False)]
-        except Exception:
+            print(f"[DEBUG] 過濾後 df.shape={df.shape}")
+        except Exception as e:
+            print(f"[DEBUG] str.contains 失敗: {e}，改用手動迴圈")
             filtered = []
             for idx, value in df[sec_type_col].items():
                 if "股票" in str(value):
                     filtered.append(idx)
             df = df.loc[filtered]
+            print(f"[DEBUG] 手動過濾後 df.shape={df.shape}")
 
+    print(f"[DEBUG] 開始從 {namecol} 欄位提取代碼...")
     for v in df[namecol].astype(str).fillna(""):
         m = re.match(r"^\s*(\d{3,4})\s*(.+?)\s*$", v)
         if m:
@@ -169,12 +197,14 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
                 continue
         out.append((code, name))
 
+    print(f"[DEBUG] 提取前 dedup: {len(out)} 筆")
     seen = set()
     dedup = []
     for c, n in out:
         if c not in seen:
             seen.add(c)
             dedup.append((c, n))
+    print(f"[DEBUG] 提取後 dedup: {len(dedup)} 筆")
     return dedup
 
 
@@ -187,19 +217,25 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
     })
     all_entries: List[Tuple[str, str]] = []
     for mode in (2, 4):
+        print(f"\n[DEBUG] ========== 處理 mode={mode} ==========")
         try:
             html = _fetch_isin_html(mode, session, timeout=30)
             df_table = _parse_isin_table_from_html(html)
             if df_table is None or df_table.empty:
+                print(f"[DEBUG] mode={mode}: 表格為空")
                 continue
             entries = _extract_code_name(df_table)
+            print(f"[DEBUG] mode={mode}: 提取到 {len(entries)} 檔股票")
             if entries:
                 all_entries.extend(entries)
             time.sleep(0.5)
         except Exception as e:
             print(f"警告: 抓取 mode={mode} 時出錯: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
+    print(f"\n[DEBUG] 兩個 mode 共取得 {len(all_entries)} 筆 (未去重)")
     seen = set()
     out = []
     for code, name in all_entries:
@@ -209,6 +245,7 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
             if limit and len(out) >= limit:
                 break
 
+    print(f"[DEBUG] 去重後共 {len(out)} 檔股票")
     os.makedirs(RESULTS_DIR, exist_ok=True)
     try:
         pd.DataFrame(out, columns=["code", "name"]).to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
