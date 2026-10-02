@@ -42,6 +42,12 @@ PARTIAL_CSV = os.path.join(RESULTS_DIR, "partial_results.csv")
 FINAL_CSV = os.path.join(RESULTS_DIR, "final_results.csv")
 
 
+def is_standard_tw_stock_code(code: str) -> bool:
+    """僅接受上市/上櫃標準股票代號，例如 2330、3008，排除權證/ETF/其他衍生商品。"""
+    s = str(code).strip().upper()
+    return bool(re.fullmatch(r"\d{3,4}", s))
+
+
 def read_tickers_from_csv(path: str, limit: int = 0) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     if not os.path.exists(path):
@@ -51,9 +57,9 @@ def read_tickers_from_csv(path: str, limit: int = 0) -> List[Tuple[str, str]]:
         for row in reader:
             if not row:
                 continue
-            code = str(row[0]).strip()
-            # skip header-like lines
-            if not code or not re.match(r"^\d{3,4}$", code):
+            code = str(row[0]).strip().upper()
+            # 排除權證/ETF/其他非標準股票代號（例如 03140T）
+            if not code or not is_standard_tw_stock_code(code):
                 continue
             name = row[1].strip() if len(row) > 1 else ""
             out.append((code, name))
@@ -204,6 +210,9 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
                 name = parts[1] if len(parts) > 1 else ""
             else:
                 continue
+        # 排除非標準股票代號（如權證 03140T、ETF/衍生性商品）
+        if not is_standard_tw_stock_code(code):
+            continue
         out.append((code, name))
 
     print(f"[DEBUG] 提取前 dedup: {len(out)} 筆")
@@ -248,6 +257,8 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
     seen = set()
     out = []
     for code, name in all_entries:
+        if not is_standard_tw_stock_code(code):
+            continue
         if code not in seen:
             seen.add(code)
             out.append((code, name))
@@ -271,7 +282,12 @@ def load_tickers(args) -> List[Tuple[str, str]]:
     if os.path.exists(CACHE_CSV) and not args.force_refresh:
         try:
             df = pd.read_csv(CACHE_CSV, dtype={"code": str})
-            stocks = [(str(r["code"]).zfill(3), r.get("name", "")) for _, r in df.iterrows()]
+            stocks = []
+            for _, r in df.iterrows():
+                code = str(r["code"]).strip().upper()
+                if not is_standard_tw_stock_code(code):
+                    continue
+                stocks.append((code.zfill(4), r.get("name", "")))
             if args.limit:
                 stocks = stocks[: args.limit]
             if stocks:
