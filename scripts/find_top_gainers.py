@@ -78,12 +78,10 @@ def _fetch_isin_html(mode: int, session: requests.Session, timeout: int = 30) ->
     return html
 
 
-
 def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     """
     更健壯的 parse：先用 StringIO + pd.read_html，失敗時 fallback 用 BeautifulSoup 手動解析 <table>。
     """
-    # 1) safe pd.read_html via StringIO (解掉 FutureWarning)
     try:
         tables = pd.read_html(StringIO(html), encoding="utf-8", flavor="lxml")
     except Exception:
@@ -93,15 +91,12 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
             tables = []
 
     if tables:
-        # 優先找包含關鍵欄位的 table
         for t in tables:
             cols = [str(c) for c in t.columns]
             if any("有價" in c or "證券" in c or "代號" in c or "名稱" in c for c in cols):
                 return t
-        # fallback: 回傳第一個表格
         return tables[0]
 
-    # 2) fallback: 用 BeautifulSoup 手動解析第一個 <table>
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
@@ -115,12 +110,10 @@ def _parse_isin_table_from_html(html: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
-    # pad rows to same length
     maxc = max(len(r) for r in rows)
     rows_padded = [r + [""] * (maxc - len(r)) for r in rows]
     df = pd.DataFrame(rows_padded)
 
-    # 如果第一列看起來像 header（含中文欄名），把它當 header
     first_row = " ".join(map(str, df.iloc[0].tolist()))
     if any(k in first_row for k in ["有價", "證券", "代號", "名稱"]):
         df.columns = df.iloc[0].tolist()
@@ -139,7 +132,6 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
         if "代號" in s and "名稱" in s:
             namecol = c
     if namecol is None:
-        # try to find a column where first non-null cell contains digits
         for c in col_candidates:
             try:
                 sample = str(df[c].dropna().iloc[0])
@@ -148,12 +140,21 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
             if re.search(r"\d{3,4}", sample):
                 namecol = c
                 break
+
     out: List[Tuple[str, str]] = []
     if namecol is None:
         return out
-    # filter for '股票'
+
     if sec_type_col is not None:
-        df = df[df[sec_type_col].astype(str).str.contains("股票", na=False)]
+        try:
+            df = df[df[sec_type_col].astype(str).str.contains("股票", na=False)]
+        except Exception:
+            filtered = []
+            for idx, value in df[sec_type_col].items():
+                if "股票" in str(value):
+                    filtered.append(idx)
+            df = df.loc[filtered]
+
     for v in df[namecol].astype(str).fillna(""):
         m = re.match(r"^\s*(\d{3,4})\s*(.+?)\s*$", v)
         if m:
@@ -167,7 +168,7 @@ def _extract_code_name(df: pd.DataFrame) -> List[Tuple[str, str]]:
             else:
                 continue
         out.append((code, name))
-    # dedup keep order
+
     seen = set()
     dedup = []
     for c, n in out:
@@ -195,9 +196,10 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
             if entries:
                 all_entries.extend(entries)
             time.sleep(0.5)
-        except Exception:
+        except Exception as e:
+            print(f"警告: 抓取 mode={mode} 時出錯: {e}")
             continue
-    # dedup and limit
+
     seen = set()
     out = []
     for code, name in all_entries:
@@ -206,7 +208,7 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
             out.append((code, name))
             if limit and len(out) >= limit:
                 break
-    # cache to CSV
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
     try:
         pd.DataFrame(out, columns=["code", "name"]).to_csv(CACHE_CSV, index=False, encoding="utf-8-sig")
@@ -216,7 +218,6 @@ def get_tw_listed_and_otc(limit: int = 0) -> List[Tuple[str, str]]:
 
 
 def load_tickers(args) -> List[Tuple[str, str]]:
-    # priority: --tickers-file -> cached results/stock_list.csv -> fetch from ISIN
     if args.tickers_file:
         print(f"讀取 ticker 清單: {args.tickers_file}")
         stocks = read_tickers_from_csv(args.tickers_file, limit=args.limit)
@@ -248,7 +249,7 @@ def download_batch_with_retry(tickers: List[str], start: str, end: str, max_retr
             df = yf.download(tickers=tickers, start=start, end=end_exclusive.strftime("%Y-%m-%d"),
                              progress=False, auto_adjust=False, threads=False)
             return df
-        except Exception as e:
+        except Exception:
             attempt += 1
             if attempt > max_retries:
                 raise
@@ -268,7 +269,6 @@ def compute_pct_from_series(s: pd.Series) -> Tuple[float, int]:
 
 def process_batches(tickers: List[str], start: str, end: str, args):
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    # remove partial if starting fresh and not resuming
     if args.resume and os.path.exists(PARTIAL_CSV):
         print(f"Resume enabled: will append to existing {PARTIAL_CSV}")
     else:
@@ -289,8 +289,7 @@ def process_batches(tickers: List[str], start: str, end: str, args):
         batch_tickers = [f"{c}.TW" for c in batch_codes]
         try:
             df = download_batch_with_retry(batch_tickers, start, end, max_retries=args.max_retries, backoff=2)
-        except Exception as e:
-            # on total failure, mark NaNs for this batch
+        except Exception:
             rows = [{"ticker": t, "pct": float("nan"), "n_days": 0} for t in batch_tickers]
             df_rows = pd.DataFrame(rows)
             if os.path.exists(PARTIAL_CSV):
@@ -300,14 +299,12 @@ def process_batches(tickers: List[str], start: str, end: str, args):
             all_rows.extend(df_rows.to_dict("records"))
             continue
 
-        # interpret df: could be empty, single-ticker, or multi-ticker multiindex
         rows = []
         if df is None or df.empty:
             for t in batch_tickers:
                 rows.append({"ticker": t, "pct": float("nan"), "n_days": 0})
         else:
             if isinstance(df.columns, pd.MultiIndex):
-                # look for 'Adj Close' or 'Close' in level 0
                 top_level = df.columns.levels[0]
                 value_col = None
                 if "Adj Close" in top_level:
@@ -327,14 +324,11 @@ def process_batches(tickers: List[str], start: str, end: str, args):
                     pct, nd = compute_pct_from_series(s)
                     rows.append({"ticker": t, "pct": pct, "n_days": nd})
             else:
-                # single-ticker style or DataFrame with single level columns
-                # try to pick 'Adj Close' or 'Close'
                 if "Adj Close" in df.columns:
                     s = df["Adj Close"].dropna()
                 elif "Close" in df.columns:
                     s = df["Close"].dropna()
                 else:
-                    # if numeric column exists, pick the last numeric-like column
                     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
                     s = df[numeric_cols[-1]].dropna() if numeric_cols else pd.Series(dtype=float)
                 for t in batch_tickers:
@@ -342,31 +336,24 @@ def process_batches(tickers: List[str], start: str, end: str, args):
                     rows.append({"ticker": t, "pct": pct, "n_days": nd})
 
         df_rows = pd.DataFrame(rows)
-        # append to partial CSV
         if os.path.exists(PARTIAL_CSV):
             df_rows.to_csv(PARTIAL_CSV, mode="a", index=False, header=False, encoding="utf-8-sig")
         else:
             df_rows.to_csv(PARTIAL_CSV, index=False, header=True, encoding="utf-8-sig")
         all_rows.extend(df_rows.to_dict("records"))
-        # polite short sleep to avoid hammering
         time.sleep(0.2)
 
-    # load final merged results (from partial)
     if os.path.exists(PARTIAL_CSV):
         final_df = pd.read_csv(PARTIAL_CSV, dtype={"ticker": str})
     else:
         final_df = pd.DataFrame(all_rows)
-    # cleanup ticker format in final_df if needed
     if "ticker" in final_df.columns:
-        # remove possible .TW suffix for matching with names elsewhere
         final_df["ticker"] = final_df["ticker"].astype(str)
-    # drop NaN pct
     final_df = final_df.dropna(subset=["pct"])
     if final_df.empty:
         print("找不到任何有效資料。")
         return None
     final_df = final_df.sort_values("pct", ascending=False).reset_index(drop=True)
-    # write final CSV
     try:
         final_df.to_csv(FINAL_CSV, index=False, encoding="utf-8-sig")
     except Exception:
@@ -394,12 +381,10 @@ def main(argv=None):
         print("日期格式錯誤，請使用 YYYY-MM-DD")
         return
 
-    # load tickers
     stocks = []
     if args.tickers_file:
         stocks = read_tickers_from_csv(args.tickers_file, limit=args.limit)
     else:
-        # if force_refresh, remove existing cache
         if args.force_refresh and os.path.exists(CACHE_CSV):
             try:
                 os.remove(CACHE_CSV)
@@ -421,10 +406,8 @@ def main(argv=None):
     if final_df is None:
         return
 
-    # 映回公司名稱 (如果有 cache)
     try:
         name_map = {c: n for c, n in stocks}
-        # ensure ticker in final_df uses numeric code (strip .TW if present)
         def strip_tw(t):
             return t.replace(".TW", "") if isinstance(t, str) else t
         final_df["code"] = final_df["ticker"].astype(str).apply(strip_tw)
@@ -435,12 +418,10 @@ def main(argv=None):
     topn = args.top
     print(f"前 {topn} 名漲幅：")
     display_df = final_df.head(topn).copy()
-    # format pct
     if "pct" in display_df.columns:
         display_df["pct"] = display_df["pct"].map(lambda x: f"{x:,.2f}%")
     print(display_df[["code", "name", "pct", "n_days"]].to_string(index=False))
 
-    # also write top N to results/topN.csv
     try:
         display_df.to_csv(os.path.join(RESULTS_DIR, f"top_{topn}.csv"), index=False, encoding="utf-8-sig")
     except Exception:
